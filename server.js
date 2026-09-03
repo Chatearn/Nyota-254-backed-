@@ -7,9 +7,8 @@ const app = express();
 
 const PORT = process.env.PORT || 10000;
 
-const BACKEND_URL =
-    process.env.BACKEND_URL ||
-    "https://nyota-backed1.onrender.com";
+const PAYLOR_BASE_URL =
+    "https://api.paylorke.com/api/v1";
 
 const PAYLOR_API_KEY =
     process.env.PAYLOR_API_KEY;
@@ -20,119 +19,57 @@ const PAYLOR_CHANNEL_ID =
 const PAYLOR_WEBHOOK_SECRET =
     process.env.PAYLOR_WEBHOOK_SECRET;
 
-
-/* =====================================================
-   PAYLOR API
-===================================================== */
-
-const PAYLOR_STK_URL =
-    "https://api.paylorke.com/api/v1/merchants/payments/stk-push";
-
-const PAYLOR_TRANSACTION_URL =
-    "https://api.paylorke.com/api/v1/merchants/payments/transactions";
-
-
-/* =====================================================
-   MIDDLEWARE
-===================================================== */
+const PUBLIC_BASE_URL =
+    process.env.PUBLIC_BASE_URL;
 
 app.use(cors());
+app.use(express.json());
 
-app.use(
-    express.json({
-        verify: (req, res, buf) => {
-            req.rawBody = Buffer.from(buf);
-        }
-    })
-);
-
-
-/* =====================================================
-   TEMPORARY PAYMENT STORAGE
-===================================================== */
-
-const payments = new Map();
-
-
-/* =====================================================
-   HOME
-===================================================== */
+/*
+=====================================================
+ HEALTH CHECK
+=====================================================
+*/
 
 app.get("/", (req, res) => {
-
     res.json({
         success: true,
-        service: "Nyota Payment Backend",
-        provider: "Paylor",
+        service: "Nyota Backed API",
         status: "online"
     });
-
 });
 
 
-/* =====================================================
-   HEALTH CHECK
-===================================================== */
-
-app.get("/health", (req, res) => {
-
-    res.json({
-        success: true,
-        status: "healthy",
-
-        paylorConfigured:
-            Boolean(
-                PAYLOR_API_KEY &&
-                PAYLOR_CHANNEL_ID
-            ),
-
-        webhookConfigured:
-            Boolean(
-                PAYLOR_WEBHOOK_SECRET
-            ),
-
-        backendUrl:
-            BACKEND_URL
-    });
-
-});
-
-
-/* =====================================================
-   NORMALIZE KENYAN PHONE
-===================================================== */
+/*
+=====================================================
+ NORMALIZE KENYAN PHONE
+=====================================================
+*/
 
 function normalizePhone(phone) {
 
-    let value =
-        String(phone || "")
-            .trim()
-            .replace(/\s+/g, "")
-            .replace(/-/g, "");
+    let value = String(phone || "")
+        .trim()
+        .replace(/\s+/g, "")
+        .replace(/-/g, "");
 
     if (value.startsWith("+254")) {
         value = value.substring(1);
     }
 
-    if (value.startsWith("07")) {
-        value =
-            "254" +
-            value.substring(1);
-    }
-
-    if (value.startsWith("01")) {
-        value =
-            "254" +
-            value.substring(1);
+    if (value.startsWith("07") || value.startsWith("01")) {
+        value = "254" + value.substring(1);
     }
 
     return value;
 }
 
 
-/* =====================================================
-   CREATE PAYMENT REFERENCE
-===================================================== */
+/*
+=====================================================
+ CREATE UNIQUE REFERENCE
+=====================================================
+*/
 
 function createReference() {
 
@@ -140,375 +77,263 @@ function createReference() {
         "NYOTA-" +
         Date.now() +
         "-" +
-        crypto
-            .randomBytes(4)
-            .toString("hex")
-            .toUpperCase()
+        crypto.randomBytes(4).toString("hex").toUpperCase()
     );
 
 }
 
 
-/* =====================================================
-   STK PUSH
-===================================================== */
+/*
+=====================================================
+ STK PUSH
+=====================================================
+*/
 
-app.post(
-    "/api/payment/stk-push",
-    async (req, res) => {
+app.post("/api/payment/stk-push", async (req, res) => {
+
+    try {
+
+        if (!PAYLOR_API_KEY) {
+
+            return res.status(500).json({
+                success: false,
+                error: "PAYLOR_API_KEY is not configured."
+            });
+
+        }
+
+        const phone =
+            normalizePhone(req.body.phone);
+
+        const amount =
+            Number(req.body.amount);
+
+        const description =
+            String(
+                req.body.description ||
+                "Nyota Backed payment"
+            );
+
+        if (!/^254\d{9}$/.test(phone)) {
+
+            return res.status(400).json({
+                success: false,
+                error: "Invalid Kenyan phone number."
+            });
+
+        }
+
+        if (
+            !Number.isFinite(amount) ||
+            amount <= 0
+        ) {
+
+            return res.status(400).json({
+                success: false,
+                error: "Invalid payment amount."
+            });
+
+        }
+
+        const reference =
+            createReference();
+
+        const payload = {
+
+            phone: phone,
+
+            amount: amount,
+
+            reference: reference,
+
+            description: description
+
+        };
+
+        /*
+        Add the configured Paylor channel
+        when supplied in Render.
+        */
+
+        if (PAYLOR_CHANNEL_ID) {
+
+            payload.channelId =
+                PAYLOR_CHANNEL_ID;
+
+        }
+
+        /*
+        Add webhook callback when the
+        public Render URL is configured.
+        */
+
+        if (PUBLIC_BASE_URL) {
+
+            payload.callbackUrl =
+                PUBLIC_BASE_URL +
+                "/api/paylor-callback";
+
+        }
+
+        console.log(
+            "NYOTA STK REQUEST:",
+            {
+                phone,
+                amount,
+                reference
+            }
+        );
+
+        const response =
+            await fetch(
+                PAYLOR_BASE_URL +
+                "/merchants/payments/stk-push",
+                {
+
+                    method: "POST",
+
+                    headers: {
+
+                        "Authorization":
+                            `Bearer ${PAYLOR_API_KEY}`,
+
+                        "Content-Type":
+                            "application/json",
+
+                        "Idempotency-Key":
+                            reference
+
+                    },
+
+                    body:
+                        JSON.stringify(payload)
+
+                }
+            );
+
+        const text =
+            await response.text();
+
+        let data;
 
         try {
 
-            const {
-                phone,
-                amount,
-                reference,
-                description
-            } = req.body;
+            data =
+                JSON.parse(text);
 
+        } catch {
 
-            /* -----------------------------------------
-               CHECK CONFIGURATION
-            ----------------------------------------- */
-
-            if (
-                !PAYLOR_API_KEY ||
-                !PAYLOR_CHANNEL_ID
-            ) {
-
-                console.error(
-                    "Paylor credentials are not configured."
-                );
-
-                return res.status(500).json({
-
-                    success: false,
-
-                    error:
-                        "Payment service is not configured."
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               PHONE
-            ----------------------------------------- */
-
-            if (!phone) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    error:
-                        "Phone number is required."
-
-                });
-
-            }
-
-
-            const normalizedPhone =
-                normalizePhone(phone);
-
-
-            if (
-                !/^254\d{9}$/.test(
-                    normalizedPhone
-                )
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    error:
-                        "Invalid Kenyan M-PESA phone number."
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               AMOUNT
-            ----------------------------------------- */
-
-            const numericAmount =
-                Number(amount);
-
-
-            if (
-                !Number.isFinite(
-                    numericAmount
-                ) ||
-                numericAmount <= 0
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    error:
-                        "Invalid payment amount."
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               REFERENCE
-            ----------------------------------------- */
-
-            const paymentReference =
-                String(
-                    reference ||
-                    createReference()
-                );
-
-
-            /* -----------------------------------------
-               CALLBACK
-            ----------------------------------------- */
-
-            const callbackUrl =
-                `${BACKEND_URL}/paylor-callback`;
-
-
-            /* -----------------------------------------
-               PAYLOR PAYLOAD
-            ----------------------------------------- */
-
-            const payload = {
-
-                phone:
-                    normalizedPhone,
-
-                amount:
-                    numericAmount,
-
-                reference:
-                    paymentReference,
-
-                channelId:
-                    PAYLOR_CHANNEL_ID,
-
-                description:
-                    description ||
-                    "Private service payment",
-
-                callbackUrl
-
+            data = {
+                raw: text
             };
 
+        }
 
-            console.log(
-                "PAYLOR STK REQUEST",
-                {
-                    phone:
-                        normalizedPhone,
+        console.log(
+            "PAYLOR RESPONSE:",
+            data
+        );
 
-                    amount:
-                        numericAmount,
+        if (!response.ok) {
 
-                    reference:
-                        paymentReference
-                }
-            );
-
-
-            /* -----------------------------------------
-               SEND TO PAYLOR
-            ----------------------------------------- */
-
-            const response =
-                await fetch(
-                    PAYLOR_STK_URL,
-                    {
-
-                        method: "POST",
-
-                        headers: {
-
-                            "Authorization":
-                                `Bearer ${PAYLOR_API_KEY}`,
-
-                            "Content-Type":
-                                "application/json",
-
-                            "Idempotency-Key":
-                                paymentReference
-
-                        },
-
-                        body:
-                            JSON.stringify(
-                                payload
-                            )
-
-                    }
-                );
-
-
-            const responseText =
-                await response.text();
-
-
-            let data;
-
-            try {
-
-                data =
-                    JSON.parse(
-                        responseText
-                    );
-
-            } catch {
-
-                data = {
-                    raw:
-                        responseText
-                };
-
-            }
-
-
-            console.log(
-                "PAYLOR RESPONSE",
-                response.status,
-                data
-            );
-
-
-            /* -----------------------------------------
-               PAYLOR REJECTED REQUEST
-            ----------------------------------------- */
-
-            if (!response.ok) {
-
-                return res.status(
-                    response.status
-                ).json({
-
-                    success: false,
-
-                    error:
-                        data.message ||
-                        data.error ||
-                        "Paylor rejected the payment request.",
-
-                    paylor:
-                        data
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               PAYLOR TRANSACTION ID
-            ----------------------------------------- */
-
-            const transactionId =
-                data.transactionId ||
-                data.id ||
-                data.checkout_request_id ||
-                null;
-
-
-            /* -----------------------------------------
-               SAVE PAYMENT
-            ----------------------------------------- */
-
-            payments.set(
-                paymentReference,
-                {
-
-                    reference:
-                        paymentReference,
-
-                    transactionId:
-                        transactionId,
-
-                    phone:
-                        normalizedPhone,
-
-                    amount:
-                        numericAmount,
-
-                    status:
-                        String(
-                            data.status ||
-                            "SENT"
-                        ).toUpperCase(),
-
-                    createdAt:
-                        new Date().toISOString()
-
-                }
-            );
-
-
-            /* -----------------------------------------
-               RESPONSE TO FRONTEND
-            ----------------------------------------- */
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "STK Push sent.",
-
-                reference:
-                    paymentReference,
-
-                transactionId:
-                    transactionId,
-
-                checkout_request_id:
-                    transactionId,
-
-                status:
-                    String(
-                        data.status ||
-                        "SENT"
-                    ).toUpperCase()
-
-            });
-
-
-        } catch (error) {
-
-            console.error(
-                "STK PUSH ERROR:",
-                error
-            );
-
-            return res.status(500).json({
+            return res.status(response.status).json({
 
                 success: false,
 
                 error:
-                    "Unable to initiate payment.",
+                    data.message ||
+                    data.error ||
+                    "Paylor STK Push failed.",
 
-                message:
-                    error.message
+                paylor:
+                    data
 
             });
 
         }
 
+        const transactionId =
+            data.transactionId ||
+            data.id ||
+            "";
+
+        /*
+        Store a small in-memory record.
+        For production, use a database.
+        */
+
+        payments.set(
+            reference,
+            {
+
+                reference,
+
+                transactionId,
+
+                phone,
+
+                amount,
+
+                status:
+                    data.status ||
+                    "SENT",
+
+                createdAt:
+                    new Date().toISOString()
+
+            }
+        );
+
+        return res.json({
+
+            success: true,
+
+            reference,
+
+            transactionId,
+
+            status:
+                data.status ||
+                "SENT"
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "STK ERROR:",
+            error
+        );
+
+        return res.status(500).json({
+
+            success: false,
+
+            error:
+                "Unable to initiate payment."
+
+        });
+
     }
-);
+
+});
 
 
-/* =====================================================
-   PAYMENT STATUS
-===================================================== */
+/*
+=====================================================
+ PAYMENT STORAGE
+=====================================================
+*/
+
+const payments =
+    new Map();
+
+
+/*
+=====================================================
+ PAYMENT STATUS
+=====================================================
+*/
 
 app.get(
     "/api/payment/status",
@@ -522,259 +347,146 @@ app.get(
                     ""
                 ).trim();
 
-
-            const transactionId =
-                String(
-                    req.query.transactionId ||
-                    ""
-                ).trim();
-
-
-            if (
-                !reference &&
-                !transactionId
-            ) {
+            if (!reference) {
 
                 return res.status(400).json({
 
                     success: false,
 
                     error:
-                        "Reference or transactionId is required."
+                        "Payment reference is required."
 
                 });
 
             }
 
+            const payment =
+                payments.get(reference);
 
-            /* -----------------------------------------
-               FIND LOCAL PAYMENT
-            ----------------------------------------- */
-
-            let payment =
-                reference
-                    ? payments.get(reference)
-                    : null;
-
-
-            /* -----------------------------------------
-               ALREADY FINAL
-            ----------------------------------------- */
-
-            if (
-                payment &&
-                (
-                    payment.status ===
-                    "COMPLETED" ||
-
-                    payment.status ===
-                    "SUCCESS" ||
-
-                    payment.status ===
-                    "FAILED" ||
-
-                    payment.status ===
-                    "EXPIRED"
-                )
-            ) {
+            if (!payment) {
 
                 return res.json({
 
                     success: true,
 
-                    ...payment
+                    reference,
+
+                    status: "NOT_FOUND"
 
                 });
 
             }
 
+            /*
+            If we have a Paylor transaction ID,
+            ask Paylor for the current status.
+            */
 
-            /* -----------------------------------------
-               TRANSACTION ID
-            ----------------------------------------- */
+            if (payment.transactionId) {
 
-            const id =
-                transactionId ||
-                payment?.transactionId;
+                const response =
+                    await fetch(
 
+                        PAYLOR_BASE_URL +
+                        "/merchants/payments/transactions/" +
+                        encodeURIComponent(
+                            payment.transactionId
+                        ),
 
-            if (!id) {
+                        {
 
-                return res.json({
+                            method: "GET",
 
-                    success: true,
+                            headers: {
 
-                    reference:
-                        reference,
+                                "Authorization":
+                                    `Bearer ${PAYLOR_API_KEY}`,
 
-                    status:
-                        payment?.status ||
-                        "PENDING"
+                                "Content-Type":
+                                    "application/json"
 
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               QUERY PAYLOR
-            ----------------------------------------- */
-
-            const response =
-                await fetch(
-
-                    `${PAYLOR_TRANSACTION_URL}/${encodeURIComponent(id)}`,
-
-                    {
-
-                        method: "GET",
-
-                        headers: {
-
-                            "Authorization":
-                                `Bearer ${PAYLOR_API_KEY}`,
-
-                            "Content-Type":
-                                "application/json"
+                            }
 
                         }
 
-                    }
-
-                );
-
-
-            const responseText =
-                await response.text();
-
-
-            let data;
-
-            try {
-
-                data =
-                    JSON.parse(
-                        responseText
                     );
 
-            } catch {
+                const text =
+                    await response.text();
 
-                data = {};
+                let data;
 
-            }
+                try {
 
+                    data =
+                        JSON.parse(text);
 
-            console.log(
-                "PAYLOR STATUS",
-                response.status,
-                data
-            );
+                } catch {
 
+                    data = {};
 
-            /* -----------------------------------------
-               TEMPORARY PAYLOR ERROR
-            ----------------------------------------- */
+                }
 
-            if (!response.ok) {
+                console.log(
+                    "PAYLOR STATUS:",
+                    data
+                );
 
-                return res.json({
+                if (response.ok) {
 
-                    success: true,
+                    payment.status =
+                        data.status ||
+                        payment.status;
 
-                    reference:
+                    payment.providerRef =
+                        data.providerRef ||
+                        payment.providerRef;
+
+                    payment.mpesaReceipt =
+                        data.metadata?.mpesaReceipt ||
+                        payment.mpesaReceipt;
+
+                    payments.set(
                         reference,
+                        payment
+                    );
 
-                    transactionId:
-                        id,
-
-                    status:
-                        payment?.status ||
-                        "PENDING"
-
-                });
+                }
 
             }
-
-
-            /* -----------------------------------------
-               NORMALIZE STATUS
-            ----------------------------------------- */
-
-            const status =
-                String(
-                    data.status ||
-                    payment?.status ||
-                    "PENDING"
-                ).toUpperCase();
-
-
-            const finalReference =
-                data.reference ||
-                reference ||
-                payment?.reference;
-
-
-            const updatedPayment = {
-
-                ...(payment || {}),
-
-                reference:
-                    finalReference,
-
-                transactionId:
-                    data.transactionId ||
-                    data.id ||
-                    id,
-
-                amount:
-                    data.amount ??
-                    payment?.amount ??
-                    null,
-
-                status:
-                    status,
-
-                provider:
-                    data.provider ||
-                    payment?.provider ||
-                    "MPESA",
-
-                providerRef:
-                    data.providerRef ||
-                    payment?.providerRef ||
-                    null,
-
-                mpesaReceipt:
-                    data.metadata?.mpesaReceipt ||
-                    data.mpesaReceipt ||
-                    payment?.mpesaReceipt ||
-                    null,
-
-                updatedAt:
-                    new Date().toISOString()
-
-            };
-
-
-            payments.set(
-                finalReference,
-                updatedPayment
-            );
-
 
             return res.json({
 
                 success: true,
 
-                ...updatedPayment
+                reference:
+
+                    payment.reference,
+
+                transactionId:
+
+                    payment.transactionId,
+
+                status:
+
+                    payment.status,
+
+                providerRef:
+
+                    payment.providerRef ||
+                    "",
+
+                mpesaReceipt:
+
+                    payment.mpesaReceipt ||
+                    ""
 
             });
-
 
         } catch (error) {
 
             console.error(
-                "PAYMENT STATUS ERROR:",
+                "STATUS ERROR:",
                 error
             );
 
@@ -793,306 +505,85 @@ app.get(
 );
 
 
-/* =====================================================
-   PAYLOR CALLBACK
-===================================================== */
+/*
+=====================================================
+ PAYLOR CALLBACK
+=====================================================
+*/
 
 app.post(
-    "/paylor-callback",
+    "/api/paylor-callback",
     (req, res) => {
 
         try {
 
-            /* -----------------------------------------
-               CHECK SECRET
-            ----------------------------------------- */
+            /*
+            Paylor webhook verification should be
+            enabled before treating callback data
+            as trusted payment confirmation.
 
-            if (!PAYLOR_WEBHOOK_SECRET) {
-
-                console.error(
-                    "Webhook secret is missing."
-                );
-
-                return res.status(500).json({
-
-                    success: false,
-
-                    error:
-                        "Webhook configuration error."
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               SIGNATURE
-            ----------------------------------------- */
-
-            const signature =
-                req.headers[
-                    "x-webhook-signature"
-                ];
-
-
-            if (!signature) {
-
-                return res.status(401).json({
-
-                    success: false,
-
-                    error:
-                        "Missing webhook signature."
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               CREATE EXPECTED SIGNATURE
-            ----------------------------------------- */
-
-            const expected =
-                crypto
-                    .createHmac(
-                        "sha256",
-                        PAYLOR_WEBHOOK_SECRET
-                    )
-                    .update(
-                        req.rawBody
-                    )
-                    .digest("hex");
-
-
-            const receivedBuffer =
-                Buffer.from(
-                    String(signature)
-                        .trim()
-                        .toLowerCase()
-                );
-
-            const expectedBuffer =
-                Buffer.from(
-                    expected
-                        .trim()
-                        .toLowerCase()
-                );
-
-
-            if (
-                receivedBuffer.length !==
-                expectedBuffer.length ||
-                !crypto.timingSafeEqual(
-                    receivedBuffer,
-                    expectedBuffer
-                )
-            ) {
-
-                console.warn(
-                    "Invalid Paylor webhook signature."
-                );
-
-                return res.status(401).json({
-
-                    success: false,
-
-                    error:
-                        "Invalid webhook signature."
-
-                });
-
-            }
-
-
-            /* -----------------------------------------
-               VERIFIED CALLBACK
-            ----------------------------------------- */
-
-            const body =
-                req.body;
-
+            The raw body/signature format should be
+            matched to the Webhooks documentation
+            for your Paylor account.
+            */
 
             console.log(
-                "VERIFIED PAYLOR CALLBACK"
+                "PAYLOR CALLBACK RECEIVED:",
+                req.body
             );
 
-            console.log(
-                JSON.stringify(
-                    body,
-                    null,
-                    2
-                )
-            );
-
-
-            /* -----------------------------------------
-               SUPPORT COMMON PAYLOR STRUCTURES
-            ----------------------------------------- */
-
-            const event =
-                body.event ||
-                "";
-
-            const transaction =
-                body.transaction ||
-                body;
-
+            const data =
+                req.body || {};
 
             const reference =
-                transaction.reference ||
-                body.reference;
+                data.reference;
 
+            if (reference) {
 
-            if (!reference) {
+                const payment =
+                    payments.get(reference);
 
-                return res.json({
+                if (payment) {
 
-                    received: true
+                    payment.status =
+                        data.status ||
+                        payment.status;
 
-                });
+                    payment.transactionId =
+                        data.transactionId ||
+                        payment.transactionId;
 
-            }
+                    payment.providerRef =
+                        data.providerRef ||
+                        payment.providerRef;
 
+                    payment.mpesaReceipt =
+                        data.metadata?.mpesaReceipt ||
+                        data.mpesaReceipt ||
+                        payment.mpesaReceipt;
 
-            const existing =
-                payments.get(
-                    reference
-                ) || {};
+                    payments.set(
+                        reference,
+                        payment
+                    );
 
-
-            /* -----------------------------------------
-               DETERMINE STATUS
-            ----------------------------------------- */
-
-            let status =
-                String(
-                    transaction.status ||
-                    body.status ||
-                    ""
-                ).toUpperCase();
-
-
-            if (
-                event ===
-                "payment.success"
-            ) {
-
-                status =
-                    "COMPLETED";
+                }
 
             }
-
-
-            if (
-                event ===
-                "payment.failed"
-            ) {
-
-                status =
-                    "FAILED";
-
-            }
-
-
-            if (
-                event ===
-                "payment.expired"
-            ) {
-
-                status =
-                    "EXPIRED";
-
-            }
-
-
-            /* -----------------------------------------
-               UPDATE PAYMENT
-            ----------------------------------------- */
-
-            const updatedPayment = {
-
-                ...existing,
-
-                reference:
-                    reference,
-
-                transactionId:
-                    transaction.transactionId ||
-                    transaction.id ||
-                    existing.transactionId ||
-                    null,
-
-                amount:
-                    transaction.amount ??
-                    existing.amount ??
-                    null,
-
-                phone:
-                    transaction.phone ||
-                    existing.phone ||
-                    null,
-
-                status:
-                    status ||
-                    existing.status ||
-                    "PENDING",
-
-                provider:
-                    transaction.provider ||
-                    existing.provider ||
-                    "MPESA",
-
-                providerRef:
-                    transaction.providerRef ||
-                    existing.providerRef ||
-                    null,
-
-                mpesaReceipt:
-                    transaction.metadata?.mpesaReceipt ||
-                    transaction.mpesaReceipt ||
-                    existing.mpesaReceipt ||
-                    null,
-
-                updatedAt:
-                    new Date().toISOString()
-
-            };
-
-
-            payments.set(
-                reference,
-                updatedPayment
-            );
-
-
-            console.log(
-                "PAYMENT UPDATED:",
-                updatedPayment
-            );
-
 
             return res.json({
-
-                received: true
-
+                success: true
             });
-
 
         } catch (error) {
 
             console.error(
-                "WEBHOOK ERROR:",
+                "CALLBACK ERROR:",
                 error
             );
 
             return res.status(500).json({
-
-                success: false,
-
-                error:
-                    "Callback processing failed."
-
+                success: false
             });
 
         }
@@ -1101,91 +592,18 @@ app.post(
 );
 
 
-/* =====================================================
-   OPTIONAL DIRECT STK ROUTE
-===================================================== */
-
-app.post(
-    "/stk-push",
-    async (req, res) => {
-
-        req.url =
-            "/api/payment/stk-push";
-
-        return app._router.handle(
-            req,
-            res,
-            () => {}
-        );
-
-    }
-);
-
-
-/* =====================================================
-   404
-===================================================== */
-
-app.use(
-    (req, res) => {
-
-        res.status(404).json({
-
-            success: false,
-
-            error:
-                "Route not found."
-
-        });
-
-    }
-);
-
-
-/* =====================================================
-   SERVER
-===================================================== */
+/*
+=====================================================
+ START SERVER
+=====================================================
+*/
 
 app.listen(
     PORT,
     () => {
 
         console.log(
-            "================================="
-        );
-
-        console.log(
-            "NYOTA PAYMENT BACKEND ONLINE"
-        );
-
-        console.log(
-            `PORT: ${PORT}`
-        );
-
-        console.log(
-            `BACKEND: ${BACKEND_URL}`
-        );
-
-        console.log(
-            `PAYLOR API: ${Boolean(
-                PAYLOR_API_KEY
-            )}`
-        );
-
-        console.log(
-            `PAYLOR CHANNEL: ${Boolean(
-                PAYLOR_CHANNEL_ID
-            )}`
-        );
-
-        console.log(
-            `WEBHOOK SECRET: ${Boolean(
-                PAYLOR_WEBHOOK_SECRET
-            )}`
-        );
-
-        console.log(
-            "================================="
+            `Nyota Backed API running on port ${PORT}`
         );
 
     }
